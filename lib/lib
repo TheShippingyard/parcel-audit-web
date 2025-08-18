@@ -1,0 +1,39 @@
+import { parseISO, addBusinessDays, isAfter } from "date-fns";
+
+// FedEx service rules (simplified for prototype)
+const serviceRules: Record<string, { days: number; cutoffHour: number }> = {
+  "FedEx Priority Overnight": { days: 1, cutoffHour: 10 }, // by 10:30 AM
+  "FedEx 2Day": { days: 2, cutoffHour: 20 },               // by 8:00 PM
+  "FedEx Express Saver": { days: 3, cutoffHour: 20 },      // by 8:00 PM
+};
+
+export function auditFedexShipments(rows: any[]) {
+  const lateShipments: any[] = [];
+
+  rows.forEach((row) => {
+    const service = row["Service Type"];
+    const shipDate = parseISO(row["Shipment Date"]);
+    const deliveryDate = parseISO(row["POD Delivery Date"]);
+    const deliveryTime = row["POD Delivery Time"];
+
+    if (!serviceRules[service]) return; // skip services we don't audit
+
+    const { days, cutoffHour } = serviceRules[service];
+
+    // calculate promise date
+    const promiseDate = addBusinessDays(shipDate, days);
+
+    // if delivered after promised date or cutoff hour, flag it
+    if (isAfter(deliveryDate, promiseDate)) {
+      lateShipments.push({
+        tracking: row["Express or Ground Tracking ID"],
+        service,
+        shipDate: row["Shipment Date"],
+        delivered: row["POD Delivery Date"] + " " + deliveryTime,
+        billed: row["Net Charge Amount"] || row["Transportation Charge Amount"],
+      });
+    }
+  });
+
+  return lateShipments;
+}
