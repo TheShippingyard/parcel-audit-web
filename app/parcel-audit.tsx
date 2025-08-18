@@ -134,14 +134,18 @@ const HEADER_GUESS = {
 } as const;
 
 // ---- CSV helpers ----
-function parseCsv(file: File): Promise<Record<string, string>[]> {
-  return new Promise((resolve, reject) => {
-    Papa.parse(file, {
-      header: true,
-      skipEmptyLines: true,
-      dynamicTyping: false,
-      complete: (res) => resolve(res.data as Record<string, string>[]),
-      error: reject,
+function coalesce(
+  r: Record<string, any>,
+  keys: readonly string[],
+  fallback: string | number = ""
+): string {
+  for (const k of keys) {
+    const v = r[k];
+    if (v !== undefined && v !== null && v !== "") return String(v);
+  }
+  return String(fallback);
+}
+
     });
   });
 }
