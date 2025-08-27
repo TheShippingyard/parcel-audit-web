@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "parcel-audit-web",
   "version": "0.1.0",
   "private": true,
@@ -6,25 +6,24 @@
     "dev": "next dev --turbopack",
     "build": "next build",
     "start": "next start",
-    "clean": "rimraf .next",
+    "lint": "next lint",
     "reset": "rimraf .next && next dev --turbopack"
   },
   "dependencies": {
+    "jspdf": "^3.0.1",
     "next": "15.4.6",
+    "papaparse": "^5.5.3",
     "react": "18.3.1",
-    "react-dom": "18.3.1",
-    "papaparse": "^5.4.1",
-    "jspdf": "^2.5.2",
-    "date-fns": "^3.6.0"
+    "react-dom": "18.3.1"
   },
   "devDependencies": {
-    "typescript": "^5.5.4",
-    "@types/react": "^18.3.3",
-    "@types/node": "^20.14.10",
-    "tailwindcss": "^3.4.10",
-    "postcss": "^8.4.47",
-    "autoprefixer": "^10.4.20",
     "@tailwindcss/postcss": "^4.0.0",
-    "rimraf": "^5.0.5"
+    "@types/node": "24.3.0",
+    "@types/react": "19.1.10",
+    "autoprefixer": "^10.4.21",
+    "postcss": "^8.5.6",
+    "rimraf": "^6.0.1",
+    "tailwindcss": "^3.4.10",
+    "typescript": "^5.5.3"
   }
 }

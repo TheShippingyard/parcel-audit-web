@@ -1,0 +1,8 @@
+<svg width="180" height="36" viewBox="0 0 180 36" xmlns="http://www.w3.org/2000/svg">
+  <rect x="0" y="0" width="36" height="36" rx="8" fill="#0B3D91"/>
+  <path d="M10 18h16" stroke="#F59E0B" stroke-width="2" stroke-linecap="round"/>
+  <path d="M18 10v16" stroke="#F59E0B" stroke-width="2" stroke-linecap="round"/>
+  <text x="44" y="24" font-family="Inter, system-ui" font-size="18" font-weight="800" fill="#0B3D91">
+    Parcel Audit
+  </text>
+</svg>

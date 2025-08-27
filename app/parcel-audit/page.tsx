@@ -1,783 +1,492 @@
-// app/parcel-audit/page.tsx — Full Audit Wizard (UPS headers aligned)
+// app/parcel-audit/page.tsx
 "use client";
 
 import { useMemo, useState } from "react";
 import * as Papa from "papaparse";
 import { jsPDF } from "jspdf";
-import { addBusinessDays, isAfter, parse } from "date-fns";
-import { Card, CardContent } from "@/components/ui/card";
-import { Button } from "@/components/ui/button";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Progress } from "@/components/ui/progress";
 
 type Row = Record<string, any>;
-type Item = { tracking: string; side: "CarrierOnly" | "POSOnly"; note: string };
 
-type LateRow = {
+type Discrepancy = {
   tracking: string;
-  carrier: "UPS" | "FedEx" | "DHL";
-  service: string;
-  shipDate: string;
-  delivered: string;
-  billed?: string;
+  invoice: string;
+  carrierAmount: number;
+  posAmount: number;
+  difference: number;
+  note: "Overbilled" | "Underbilled – Review" | "Match – OK";
 };
 
-type ChargeIssue = {
-  tracking: string;
-  carrier: string;
-  description: string;
-  amount: number;
-  note: string;
-};
+function cleanMoney(x: any): number {
+  if (x == null) return 0;
+  let s = String(x).trim();
+  const parenNeg = /^\(.*\)$/.test(s);
+  s = s.replace(/[()]/g, "").replace(/[^0-9.\-]/g, "");
+  if (!s || s === "-" || s === ".") return 0;
+  const n = Number(s);
+  if (isNaN(n)) return 0;
+  return parenNeg ? -Math.abs(n) : n;
+}
 
-const BRAND = { name: "The Shipping Yard", accent: "#16a34a", accentSoft: "#dcfce7", textMuted: "#475569" };
-
-/** -------- Flexible header keys (robust to slight name differences) -------- */
-const CARRIER_KEYS = [
-  "Tracking Number", "TrackingNumber", "Tracking #", "Tracking ID", "Air Waybill", "AWB",
-  "Shipment Number", "Express or Ground Tracking ID", "Tracking Number 1", "Package Tracking Number",
-];
-const POS_KEYS = ["Tracking Number", "TrackingNumber", "Tracking #", "Tracking"] as const;
-const POS_ADDR_KEYS = ["Address Type", "Residential", "Is Residential", "Residential Indicator", "Dest Type", "Recipient Type"] as const;
-
-/** -------- Carrier column maps (updated for your UPS invoice files) -------- */
-// FedEx (unchanged)
-const FEDEX_COLS = {
-  tracking: ["Express or Ground Tracking ID","Tracking ID","Tracking Number","TrackingNumber","Tracking #"],
-  service: ["Service Type","Service"],
-  shipDate: ["Shipment Date","Ship Date"],
-  podDate: ["POD Delivery Date","Delivery Date"],
-  podTime: ["POD Delivery Time","Delivery Time"],
-  netCharge: ["Net Charge Amount","Transportation Charge Amount","Total Charges"],
-} as const;
-
-// UPS (UPDATED to match your uploads: “Service Level”, “Pickup Date”, “Transportation Charges”, etc.)
-const UPS_COLS = {
-  tracking: ["Tracking Number","TrackingNumber","Tracking #","Package Tracking Number","Tracking Number 1"],
-  service: ["Service Level","Service","Shipment Service"],
-  shipDate: ["Pickup Date","Ship Date","Shipment Date"],
-  // Many UPS invoice exports do NOT include delivery date/time; we’ll try POS for that if missing:
-  podDate: ["Delivery Date","Actual Delivery Date","Billed Delivery Date"],
-  podTime: ["Delivery Time","Actual Delivery Time"],
-  // Amounts commonly present in UPS invoice:
-  netCharge: ["Total Charges","Net Charges","Net Amount","Transportation Charges"],
-} as const;
-
-// DHL (unchanged)
-const DHL_COLS = {
-  tracking: ["Air Waybill","AWB","Waybill Number","Shipment Number","Tracking Number"],
-  service: ["Product","Service","Service Type"],
-  shipDate: ["Shipment Date","Ship Date","Pickup Date"],
-  podDate: ["Delivery Date","POD Date"],
-  podTime: ["Delivery Time","POD Time"],
-  netCharge: ["Total Net Amount","Charges","Net Charge Amount","Shipment Amount","Total Charges"],
-} as const;
-
-/** -------- Prototype promise rules (for late delivery) -------- */
-const FEDEX_RULES: Record<string,{days:number;cutoff:string}> = {
-  "FEDEX PRIORITY OVERNIGHT": { days: 1, cutoff: "10:30" },
-  "FEDEX STANDARD OVERNIGHT": { days: 1, cutoff: "15:00" },
-  "FEDEX 2DAY": { days: 2, cutoff: "20:00" },
-  "FEDEX EXPRESS SAVER": { days: 3, cutoff: "20:00" },
-};
-const UPS_RULES: Record<string,{days:number;cutoff:string}> = {
-  "UPS NEXT DAY AIR": { days: 1, cutoff: "10:30" },
-  "UPS NEXT DAY AIR SAVER": { days: 1, cutoff: "15:00" },
-  "UPS 2ND DAY AIR": { days: 2, cutoff: "20:00" },
-  "UPS 3 DAY SELECT": { days: 3, cutoff: "20:00" },
-  "GROUND": { days: 5, cutoff: "20:00" }, // broad default if you want one
-};
-const DHL_RULES: Record<string,{days:number;cutoff:string}> = {
-  "DHL EXPRESS WORLDWIDE": { days: 1, cutoff: "20:00" },
-  "DHL EXPRESS 12:00": { days: 1, cutoff: "12:00" },
-  "DHL EXPRESS 9:00": { days: 1, cutoff: "09:00" },
-  "DHL EXPRESS 10:30": { days: 1, cutoff: "10:30" },
-  "DHL ECONOMY SELECT": { days: 2, cutoff: "20:00" },
-};
-
-/** -------- Utilities -------- */
-function getVal(r: Row, keys: readonly string[]) {
-  // direct match first
-  for (const k of keys) if (r[k] != null && r[k] !== "") return String(r[k]).trim();
-  // then normalize (case/space/punct tolerant)
-  const norm = (s: string) => s.toLowerCase().replace(/[^a-z0-9]/g, "");
+function getByHeader(r: Row, header: string) {
+  if (r[header] != null) return r[header];
+  const norm = (h: string) => h.toLowerCase().replace(/[^a-z0-9]+/g, "");
   const map: Record<string, string> = {};
-  for (const key of Object.keys(r)) map[norm(key)] = key;
-  for (const k of keys) {
-    const hit = map[norm(k)];
-    if (hit && r[hit] != null && r[hit] !== "") return String(r[hit]).trim();
-  }
-  return "";
-}
-function toNumber(x: any): number {
-  if (x == null || x === "") return 0;
-  const n = Number(String(x).replace(/[$,]/g, ""));
-  return isNaN(n) ? 0 : n;
-}
-function tryParseDate(s: string) {
-  const pats = ["M/d/yyyy","MM/dd/yyyy","yyyy-MM-dd","yyyy/MM/dd"];
-  for (const p of pats) {
-    try { return parse(s, p, new Date()); } catch {}
-  }
-  const d = new Date(s);
-  return isNaN(d.getTime()) ? null : d;
-}
-function combineDateTime(dateStr: string, timeStr?: string) {
-  const base = tryParseDate((dateStr || "").trim()); if (!base) return null;
-  const t = (timeStr || "").trim().replace(/[^0-9:]/g, "");
-  if (t) {
-    const [hh, mm = "00"] = t.split(":");
-    base.setHours(Number(hh) || 0, Number(mm) || 0, 0, 0);
-  } else {
-    base.setHours(23, 59, 59, 999);
-  }
-  return base;
+  Object.keys(r || {}).forEach((k) => (map[norm(k)] = k));
+  const key = map[norm(header)];
+  return key ? r[key] : undefined;
 }
 
-/** -------- CSV parsers -------- */
-function parseCSVFile(file: File): Promise<Row[]> {
+function parseCSV(file: File): Promise<Row[]> {
   return new Promise((resolve) => {
-    Papa.parse(file, { header: true, skipEmptyLines: true, complete: (res) => resolve((res.data as Row[]).filter(Boolean)) });
+    Papa.parse<Row>(file, {
+      header: true,
+      skipEmptyLines: true,
+      complete: (res) => resolve((res.data as Row[]).filter(Boolean)),
+    });
   });
 }
-async function parseManyCSVFiles(files: FileList | File[]): Promise<Row[]> {
-  const list = Array.from(files || []);
-  const parts = await Promise.all(list.map(parseCSVFile));
-  return parts.flat();
-}
 
-// PostalMate/ShipRite: detect header row, then parse
-function autoParsePOSFile(file: File): Promise<Row[]> {
+// PostalMate: skip first 9 rows so row 10 is the header
+function parsePostalMate(file: File): Promise<Row[]> {
   return new Promise((resolve) => {
     const reader = new FileReader();
     reader.onload = () => {
       const raw = String(reader.result || "");
-      const preview = Papa.parse<string[]>(raw, { header: false, skipEmptyLines: true }).data as string[][];
-      const hdrs = [
-        /tracking\s*#|tracking\s*number|tracking\b/i,
-        /service\b|service\s*type/i,
-        /ship\s*date|shipment\s*date/i,
-        /delivered|delivery\s*date|delivery\s*time|POD/i,
-        /charges?|amount|net\s*charge/i,
-        /recipient|customer|consignee/i,
-      ];
-      let idx = -1;
-      for (let i = 0; i < preview.length; i++) {
-        const row = (preview[i] || []).map((c) => String(c || ""));
-        const hits = hdrs.reduce((a, rx) => a + (row.some((c) => rx.test(c)) ? 1 : 0), 0);
-        if (hits >= 2) { idx = i; break; }
-      }
       const lines = raw.split(/\r?\n/);
-      const body = idx >= 0 ? lines.slice(idx).join("\n") : raw;
-      const parsed = Papa.parse<Row>(body, { header: true, skipEmptyLines: true });
-      resolve((parsed.data as Row[]).filter((r) => r && Object.keys(r).length > 0));
+      const cleaned = lines.slice(9).join("\n");
+      const parsed = Papa.parse<Row>(cleaned, {
+        header: true,
+        skipEmptyLines: true,
+        transformHeader: (h) => h.trim(),
+      });
+      const data = (parsed.data as Row[]).filter(
+        (r) => r && Object.values(r).some((v) => String(v ?? "").trim() !== "")
+      );
+      resolve(data);
     };
     reader.readAsText(file);
   });
 }
-async function parseManyPOSFiles(files: FileList | File[]): Promise<Row[]> {
-  const list = Array.from(files || []);
-  const parts = await Promise.all(list.map(autoParsePOSFile));
-  return parts.flat();
-}
 
-// Build POS index (for extra checks, including Delivered Date)
-function buildPosIndex(rows: Row[]) {
-  const idx: Record<string, { isResidential: boolean | null; deliveredDate?: string; deliveredTime?: string }> = {};
+// UPS: Tracking Number + Billed Charge + Invoice Number
+async function buildUPSMap(files: FileList | null) {
+  const out: Record<string, { amt: number; invoice: string }> = {};
+  if (!files || !files.length) return { map: out, rows: 0 };
+
+  const TRACKING_H = "Tracking Number"; // col E
+  const AMOUNT_H = "Billed Charge";     // col AB
+  const INVOICE_H = "Invoice Number";
+
+  const parts = await Promise.all(Array.from(files).map(parseCSV));
+  const rows = parts.flat();
+
   rows.forEach((r) => {
-    const t = getVal(r, POS_KEYS as unknown as string[]);
-    if (!t) return;
-    let isRes: boolean | null = null;
-    for (const k of POS_ADDR_KEYS) {
-      if (r[k] == null) continue;
-      const v = String(r[k]).toLowerCase();
-      if (["res","residential","r"].includes(v)) isRes = true;
-      else if (["bus","business","commercial","b"].includes(v)) isRes = false;
-      else if (v === "true" || v === "yes" || v === "1") isRes = true;
-      else if (v === "false" || v === "no" || v === "0") isRes = false;
-    }
-    // Common POS delivered fields
-    const deliveredDate = getVal(r, ["Delivered Date","Delivery Date","POD Date","DeliveredDate","DeliveryDate"]);
-    const deliveredTime = getVal(r, ["Delivered Time","Delivery Time","POD Time","DeliveredTime","DeliveryTime"]);
-    idx[t] = { isResidential: isRes, deliveredDate: deliveredDate || undefined, deliveredTime: deliveredTime || undefined };
+    const tracking = String(getByHeader(r, TRACKING_H) ?? "").trim();
+    if (!tracking) return;
+    const amt = cleanMoney(getByHeader(r, AMOUNT_H) ?? 0);
+    const invoice = String(getByHeader(r, INVOICE_H) ?? "").trim();
+    if (!out[tracking]) out[tracking] = { amt: 0, invoice };
+    out[tracking].amt += amt;
+    if (!out[tracking].invoice && invoice) out[tracking].invoice = invoice;
   });
-  return idx;
+
+  return { map: out, rows: rows.length };
 }
 
-/** -------- Late delivery audit -------- */
-function auditCarrierRowsWithPOS(
-  rows: Row[],
-  COLS: typeof FEDEX_COLS | typeof UPS_COLS | typeof DHL_COLS,
-  RULES: Record<string, { days: number; cutoff: string }>,
-  carrierLabel: "UPS" | "FedEx" | "DHL",
-  posIndex?: Record<string, { isResidential: boolean | null; deliveredDate?: string; deliveredTime?: string }>
-): LateRow[] {
-  const out: LateRow[] = [];
-  rows.forEach((row) => {
-    const tracking = getVal(row, COLS.tracking as readonly string[]);
-    const serviceRaw = getVal(row, COLS.service as readonly string[]);
-    const key = serviceRaw.toUpperCase();
-    if (!tracking || !key) return;
+// PostalMate: Tracking # + PostalMate amount
+async function buildPostalMateMap(files: FileList | null) {
+  const out: Record<string, number> = {};
+  if (!files || !files.length) return { map: out, rows: 0 };
 
-    const matched = Object.keys(RULES).find((k) => key.includes(k));
-    if (!matched) return;
+  const TRACKING_H = "Tracking #"; // col D
+  const AMOUNT_H = "PostalMate";   // col E
 
-    const shipDateStr = getVal(row, COLS.shipDate as readonly string[]);
-    if (!shipDateStr) return;
+  const parts = await Promise.all(Array.from(files).map(parsePostalMate));
+  const rows = parts.flat();
 
-    // Prefer carrier POD; if missing (UPS invoices often), try POS POD
-    let podDateStr = getVal(row, COLS.podDate as readonly string[]);
-    let podTimeStr = getVal(row, COLS.podTime as readonly string[]);
-    if ((!podDateStr || podDateStr === "") && posIndex && tracking in posIndex) {
-      podDateStr = posIndex[tracking].deliveredDate || "";
-      podTimeStr = posIndex[tracking].deliveredTime || "";
-    }
-    if (!podDateStr) return; // still nothing: skip late check
-
-    const shipped = tryParseDate(shipDateStr);
-    const delivered = combineDateTime(podDateStr, podTimeStr);
-    if (!shipped || !delivered) return;
-
-    const promised = addBusinessDays(new Date(shipped), RULES[matched].days);
-    const [hh, mm] = RULES[matched].cutoff.split(":").map(Number);
-    promised.setHours(hh || 0, mm || 0, 0, 0);
-
-    if (isAfter(delivered, promised)) {
-      out.push({
-        tracking,
-        carrier: carrierLabel,
-        service: serviceRaw,
-        shipDate: shipDateStr,
-        delivered: `${podDateStr}${podTimeStr ? " " + podTimeStr : ""}`,
-        billed: getVal(row, COLS.netCharge as readonly string[]) || "",
-      });
-    }
+  rows.forEach((r) => {
+    const tracking = String(getByHeader(r, TRACKING_H) ?? "").trim();
+    if (!tracking) return;
+    const amt = cleanMoney(getByHeader(r, AMOUNT_H) ?? 0);
+    out[tracking] = (out[tracking] || 0) + amt;
   });
-  return out;
+
+  return { map: out, rows: rows.length };
 }
 
-/** -------- Billing/surcharge audit -------- */
-const SURCHARGE_KEYWORDS = [
-  { kw: /address\s*correction/i, label: "Address Correction Fee" },
-  { kw: /residential/i, label: "Residential Surcharge" },
-  { kw: /saturday/i, label: "Saturday Delivery Surcharge" },
-  { kw: /delivery\s*area/i, label: "Delivery Area Surcharge" },
-  { kw: /additional\s*handling/i, label: "Additional Handling" },
-  { kw: /oversize|large\s*package/i, label: "Oversize/Large Package" },
-  { kw: /fuel\s*surcharge/i, label: "Fuel Surcharge" },
+// Export table to CSV
+function exportDiscrepanciesCSV(rows: Discrepancy[]) {
+  if (!rows.length) return;
+  const headers = [
+    "Tracking #",
+    "Invoice #",
+    "UPS Billed Charge",
+    "PostalMate Amount",
+    "Difference",
+    "Note",
+  ];
+
+  const lines = rows.map((r) => [
+    r.tracking,
+    r.invoice || "",
+    r.carrierAmount.toFixed(2),
+    r.posAmount.toFixed(2),
+    r.difference.toFixed(2),
+    r.note,
+  ]);
+
+  const csv = [headers, ...lines]
+    .map((a) =>
+      a
+        .map((cell) => {
+          const s = String(cell ?? "");
+          if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+          return s;
+        })
+        .join(",")
+    )
+    .join("\n");
+
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `parcel_audit_${new Date().toISOString().slice(0, 10)}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// Shared steps (for Copy + PDF)
+const DISPUTE_STEPS = [
+  "Log in to ups.com.",
+  "Open the Billing Center from the side dashboard.",
+  "Go to My Invoices.",
+  "Click the blue Invoice Number link for the invoice you want to dispute.",
+  "Find your shipment by the Tracking Number.",
+  "Under ACTION, click the three dots (⋯) and choose Dispute.",
+  "Select your dispute reason and add any comments.",
+  "Click Submit. Dispute Submitted!",
 ];
 
-// Try to find pairs like “Charge Description 1” / “Charge Amount 1” (if present)
-function findChargePairs(headers: string[]) {
-  const descCols: { key: string; idx: string }[] = [];
-  const amtCols: { key: string; idx: string }[] = [];
-  headers.forEach((h) => {
-    const m = h.match(/(Charge\s*Description|Description)\.?([0-9]+)?/i);
-    if (m) descCols.push({ key: h, idx: m[2] || "" });
-    const m2 = h.match(/(Charge\s*Amount|Amount)\.?([0-9]+)?/i);
-    if (m2) amtCols.push({ key: h, idx: m2[2] || "" });
-  });
-  const pairs: { desc: string; amt: string }[] = [];
-  const used = new Set<string>();
-  descCols.forEach((d, i) => {
-    let match = amtCols.find((a) => a.idx && a.idx === d.idx && !used.has(a.key));
-    if (!match) match = amtCols.find((a, j) => j === i && !used.has(a.key));
-    if (match) { pairs.push({ desc: d.key, amt: match.key }); used.add(match.key); }
-  });
-  return pairs;
+const HISTORY_STEPS = [
+  "In Billing Center, look at the left dashboard.",
+  "Click Dispute & Refund History (just below My Invoices).",
+  "View the status of submitted disputes, decisions, and refunds.",
+  "Use filters (date, invoice) to narrow results.",
+];
+
+function stepsToClipboardText() {
+  const lines = [
+    "How to Create a UPS Dispute",
+    ...DISPUTE_STEPS.map((s, i) => `${i + 1}. ${s}`),
+    "",
+    "Where to Find Dispute & Refund History",
+    ...HISTORY_STEPS.map((s, i) => `${i + 1}. ${s}`),
+  ];
+  return lines.join("\n");
 }
 
-function auditBillingIssues(
-  rows: Row[],
-  carrierLabel: string,
-  trackingKeys: readonly string[],
-  posIndex?: Record<string, { isResidential: boolean | null }>
-): ChargeIssue[] {
-  if (!rows.length) return [];
-  const headers = Object.keys(rows[0] || {});
-  const pairs = findChargePairs(headers);
-  const issues: ChargeIssue[] = [];
-  const perTrack: Record<string, { items: { desc: string; amt: number }[]; transAmt: number; fuelAmt: number }> = {};
+async function copyStepsToClipboard() {
+  const text = stepsToClipboardText();
+  try {
+    await navigator.clipboard.writeText(text);
+    alert("Steps copied to clipboard ✅");
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+    alert("Steps copied to clipboard ✅");
+  }
+}
 
-  rows.forEach((r) => {
-    const tracking = getVal(r, trackingKeys as unknown as string[]);
-    if (!tracking) return;
+function downloadStepsPDF() {
+  const doc = new jsPDF({ unit: "pt", format: "letter" });
+  const left = 54;
+  let y = 64;
 
-    if (!perTrack[tracking]) perTrack[tracking] = { items: [], transAmt: 0, fuelAmt: 0 };
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(16);
+  doc.text("How to Create a UPS Dispute", left, y);
+  y += 20;
 
-    // Transportation amount (UPS invoices usually have “Transportation Charges”, but fall back to others)
-    const transCand =
-      r["Transportation Charges"] ||
-      r["Transportation Charge Amount"] ||
-      r["Net Charges"] ||
-      r["Net Charge Amount"] ||
-      r["Total Charges"];
-    const fuelCand = r["Fuel Surcharge"] || r["Fuel Surcharge Amount"];
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(12);
+  DISPUTE_STEPS.forEach((s, i) => {
+    const line = `${i + 1}. ${s}`;
+    const split = doc.splitTextToSize(line, 500);
+    split.forEach((ln: string) => {
+      if (y > 740) { doc.addPage(); y = 64; }
+      doc.text(ln, left, y);
+      y += 16;
+    });
+  });
 
-    perTrack[tracking].transAmt = perTrack[tracking].transAmt || toNumber(transCand);
-    perTrack[tracking].fuelAmt += toNumber(fuelCand);
+  y += 16;
+  if (y > 740) { doc.addPage(); y = 64; }
 
-    // If there are explicit itemized descriptions/amounts, use them
-    if (pairs.length) {
-      pairs.forEach(({ desc, amt }) => {
-        const d = String(r[desc] ?? "").trim();
-        const a = toNumber(r[amt]);
-        if (!d || a === 0) return;
+  doc.setFont("helvetica", "bold");
+  doc.setFontSize(16);
+  doc.text("Where to Find Dispute & Refund History", left, y);
+  y += 20;
 
-        perTrack[tracking].items.push({ desc: d, amt: a });
+  doc.setFont("helvetica", "normal");
+  doc.setFontSize(12);
+  HISTORY_STEPS.forEach((s, i) => {
+    const line = `${i + 1}. ${s}`;
+    const split = doc.splitTextToSize(line, 500);
+    split.forEach((ln: string) => {
+      if (y > 740) { doc.addPage(); y = 64; }
+      doc.text(ln, left, y);
+      y += 16;
+    });
+  });
 
-        const hit = SURCHARGE_KEYWORDS.find((s) => s.kw.test(d));
-        if (hit) {
-          let note = hit.label;
-          if (/residential/i.test(d) && posIndex && tracking in posIndex) {
-            const p = posIndex[tracking];
-            if (p.isResidential === false) note += " — POS indicates BUSINESS, verify surcharge";
-          }
-          issues.push({ tracking, carrier: carrierLabel, description: d, amount: a, note });
-        }
+  const fname = `UPS_Dispute_and_History_${new Date().toISOString().slice(0,10)}.pdf`;
+  doc.save(fname);
+}
+
+export default function ParcelAuditPage() {
+  const [upsFiles, setUPSFiles] = useState<FileList | null>(null);
+  const [posFiles, setPosFiles] = useState<FileList | null>(null);
+
+  const [carrierRows, setCarrierRows] = useState(0);
+  const [posRows, setPosRows] = useState(0);
+
+  const [discrepancies, setDiscrepancies] = useState<Discrepancy[]>([]);
+  const [isRunning, setIsRunning] = useState(false);
+
+  const [showDisputeHelp, setShowDisputeHelp] = useState(false);
+  const [showHistoryHelp, setShowHistoryHelp] = useState(false);
+
+  async function handleAudit() {
+    if (!upsFiles || !upsFiles.length) {
+      alert("Upload UPS invoice CSVs first.");
+      return;
+    }
+    if (!posFiles || !posFiles.length) {
+      alert("Upload PostalMate CSV(s) next.");
+      return;
+    }
+
+    setIsRunning(true);
+    try {
+      const ups = await buildUPSMap(upsFiles);
+      const pos = await buildPostalMateMap(posFiles);
+
+      setCarrierRows(ups.rows);
+      setPosRows(pos.rows);
+
+      const all = new Set<string>([...Object.keys(ups.map), ...Object.keys(pos.map)]);
+      const out: Discrepancy[] = [];
+
+      for (const t of all) {
+        const cObj = ups.map[t];
+        const c = cObj?.amt ?? 0;
+        const invoice = cObj?.invoice ?? "";
+        const p = pos.map[t] ?? 0;
+        const diff = c - p;
+
+        let note: Discrepancy["note"] = "Match – OK";
+        if (Math.abs(diff) > 0.01) note = diff > 0 ? "Overbilled" : "Underbilled – Review";
+
+        out.push({ tracking: t, invoice, carrierAmount: c, posAmount: p, difference: diff, note });
+      }
+
+      out.sort((a, b) => {
+        const aScore = a.note === "Match – OK" ? 1 : 0;
+        const bScore = b.note === "Match – OK" ? 1 : 0;
+        if (aScore !== bScore) return aScore - bScore;
+        return Math.abs(b.difference) - Math.abs(a.difference);
       });
-    } else {
-      // No itemized pairs: we can still flag a generic “fuel anomaly” if fuel % looks wrong
-      if (perTrack[tracking].fuelAmt > 0 && perTrack[tracking].transAmt > 0) {
-        const pct = perTrack[tracking].fuelAmt / perTrack[tracking].transAmt;
-        if (pct > 0.35 || pct < 0) {
-          issues.push({
-            tracking,
-            carrier: carrierLabel,
-            description: "Fuel Surcharge",
-            amount: Number(perTrack[tracking].fuelAmt.toFixed(2)),
-            note: `Fuel surcharge anomaly (${(pct * 100).toFixed(1)}% of transportation)`,
-          });
-        }
-      }
+
+      setDiscrepancies(out);
+    } finally {
+      setIsRunning(false);
     }
-  });
+  }
 
-  // Duplicate detection (only possible if we saw itemized lines)
-  Object.entries(perTrack).forEach(([tracking, data]) => {
-    const keyCount: Record<string, number> = {};
-    data.items.forEach((it) => {
-      const key = `${it.desc}|${it.amt.toFixed(2)}`;
-      keyCount[key] = (keyCount[key] || 0) + 1;
+  const summary = useMemo(() => {
+    let overAmt = 0, underAmt = 0, overCount = 0, underCount = 0, okCount = 0;
+    discrepancies.forEach((d) => {
+      if (d.note === "Overbilled") { overAmt += d.difference; overCount++; }
+      else if (d.note === "Underbilled – Review") { underAmt += -d.difference; underCount++; }
+      else { okCount++; }
     });
-    Object.entries(keyCount).forEach(([k, count]) => {
-      if (count >= 2) {
-        const [desc, amtStr] = k.split("|");
-        issues.push({
-          tracking,
-          carrier: carrierLabel,
-          description: desc,
-          amount: Number(amtStr),
-          note: "Possible duplicate charge",
-        });
-      }
-    });
-  });
-
-  return issues;
-}
-
-/** -------- Component -------- */
-export default function Page() {
-  // Step state
-  const [step, setStep] = useState(1);
-
-  // Carrier CSVs (multi-file)
-  const [ups, setUPS] = useState<Row[]>([]);
-  const [fedex, setFedEx] = useState<Row[]>([]);
-  const [dhl, setDHL] = useState<Row[]>([]);
-
-  // PostalMate per carrier (multi-file)
-  const [posUPS, setPosUPS] = useState<Row[]>([]);
-  const [posFedEx, setPosFedEx] = useState<Row[]>([]);
-  const [posDHL, setPosDHL] = useState<Row[]>([]);
-
-  // Optional legacy POS (keep if you still export these)
-  const [postal, setPostal] = useState<Row[]>([]);
-  const [shiprite, setShipRite] = useState<Row[]>([]);
-
-  // Results
-  const [upsLate, setUpsLate] = useState<LateRow[]>([]);
-  const [fedexLate, setFedexLate] = useState<LateRow[]>([]);
-  const [dhlLate, setDhlLate] = useState<LateRow[]>([]);
-  const [issues, setIssues] = useState<ChargeIssue[]>([]);
-
-  // Upload handlers (multi-file)
-  function onUPSUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const files = e.target.files; if (!files?.length) return;
-    (async () => {
-      const rows = await parseManyCSVFiles(files);
-      setUPS(rows);
-      try {
-        const posIdx = buildPosIndex([...postal, ...shiprite, ...posUPS, ...posFedEx, ...posDHL]);
-        setUpsLate(auditCarrierRowsWithPOS(rows, UPS_COLS, UPS_RULES, "UPS", posIdx)); // will use POS POD if carrier lacks
-        const extra = auditBillingIssues(rows, "UPS", UPS_COLS.tracking, posIdx);
-        setIssues((prev) => [...prev, ...extra]);
-      } catch { setUpsLate([]); }
-    })();
-  }
-  function onFedexUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const files = e.target.files; if (!files?.length) return;
-    (async () => {
-      const rows = await parseManyCSVFiles(files);
-      setFedEx(rows);
-      try {
-        const posIdx = buildPosIndex([...postal, ...shiprite, ...posUPS, ...posFedEx, ...posDHL]);
-        setFedexLate(auditCarrierRowsWithPOS(rows, FEDEX_COLS, FEDEX_RULES, "FedEx", posIdx));
-        const extra = auditBillingIssues(rows, "FedEx", FEDEX_COLS.tracking, posIdx);
-        setIssues((prev) => [...prev, ...extra]);
-      } catch { setFedexLate([]); }
-    })();
-  }
-  function onDHLUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const files = e.target.files; if (!files?.length) return;
-    (async () => {
-      const rows = await parseManyCSVFiles(files);
-      setDHL(rows);
-      try {
-        const posIdx = buildPosIndex([...postal, ...shiprite, ...posUPS, ...posFedEx, ...posDHL]);
-        setDhlLate(auditCarrierRowsWithPOS(rows, DHL_COLS, DHL_RULES, "DHL", posIdx));
-        const extra = auditBillingIssues(rows, "DHL", DHL_COLS.tracking, posIdx);
-        setIssues((prev) => [...prev, ...extra]);
-      } catch { setDhlLate([]); }
-    })();
-  }
-
-  /** -------- Discrepancy compare (carrier vs POS) -------- */
-  const carrierSet = useMemo(
-    () =>
-      new Set(
-        [...ups, ...fedex, ...dhl]
-          .map((r) => {
-            const vF = getVal(r, FEDEX_COLS.tracking);
-            const vU = getVal(r, UPS_COLS.tracking);
-            const vD = getVal(r, DHL_COLS.tracking);
-            return vF || vU || vD || getVal(r, CARRIER_KEYS);
-          })
-          .filter(Boolean)
-      ),
-    [ups, fedex, dhl]
-  );
-
-  const posSet = useMemo(
-    () =>
-      new Set(
-        [...postal, ...shiprite, ...posUPS, ...posFedEx, ...posDHL]
-          .map((r) => getVal(r, POS_KEYS as unknown as string[]))
-          .filter(Boolean)
-      ),
-    [postal, shiprite, posUPS, posFedEx, posDHL]
-  );
-
-  const results = useMemo<Item[]>(() => {
-    const out: Item[] = [];
-    const all = new Set<string>([...carrierSet, ...posSet]);
-    for (const t of all) {
-      const inCarrier = carrierSet.has(t);
-      const inPOS = posSet.has(t);
-      if (inCarrier && !inPOS) out.push({ tracking: t, side: "CarrierOnly", note: "In UPS/FedEx/DHL only → reconcile in POS." });
-      if (!inCarrier && inPOS) out.push({ tracking: t, side: "POSOnly", note: "In POS only → consider VOID/REFUND claim." });
-    }
-    return out.sort((a, b) => a.tracking.localeCompare(b.tracking));
-  }, [carrierSet, posSet]);
-
-  /** -------- KPIs & controls -------- */
-  const carrierRows = ups.length + fedex.length + dhl.length;
-  const posRows = postal.length + shiprite.length + posUPS.length + posFedEx.length + posDHL.length;
-  const progress = Math.round(((step - 1) / 2) * 100);
-  const canNext1 = !!(ups.length || fedex.length || dhl.length);
-  const canNext2 = !!(posUPS.length || posFedEx.length || posDHL.length || postal.length || shiprite.length);
-
-  /** -------- Export helpers -------- */
-  function exportCSV(rows: any[], filename: string) {
-    const csv = Papa.unparse(rows);
-    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url; a.download = filename; a.click(); URL.revokeObjectURL(url);
-  }
-  function exportLateCSV(rows: LateRow[], filename: string) {
-    const data = rows.map((r) => ({
-      Tracking: r.tracking,
-      Carrier: r.carrier,
-      Service: r.service,
-      ShipDate: r.shipDate,
-      Delivered: r.delivered,
-      BilledNet: r.billed || "",
-    }));
-    exportCSV(data, filename);
-  }
-  function exportChargeIssuesCSV(rows: ChargeIssue[]) {
-    const data = rows.map((r) => ({
-      Tracking: r.tracking,
-      Carrier: r.carrier,
-      Description: r.description,
-      Amount: r.amount.toFixed(2),
-      Note: r.note,
-    }));
-    exportCSV(data, "billing_issues.csv");
-  }
-  function exportPDF_Discrepancies(rows: Item[]) {
-    const doc = new jsPDF({ unit: "pt", format: "letter" });
-    const m = 48; let y = m;
-    doc.setFont("helvetica", "bold"); doc.setFontSize(16);
-    doc.text(`${BRAND.name} – Discrepancy Report`, m, y); y += 20;
-    doc.setFont("helvetica", "normal"); doc.setFontSize(12);
-    doc.text(`Total issues: ${rows.length}`, m, y); y += 16;
-    const perPage = 30; let line = 0;
-    rows.forEach((r) => {
-      doc.text(`${r.tracking} — ${r.side} — ${r.note}`, m, y);
-      y += 14; line++;
-      if (line >= perPage) { doc.addPage(); y = m; line = 0; }
-    });
-    doc.save("discrepancy_report.pdf");
-  }
+    return { overAmt, underAmt, overCount, underCount, okCount, total: discrepancies.length };
+  }, [discrepancies]);
 
   return (
-    <main className="min-h-screen bg-neutral-50">
-      {/* Top bar */}
-      <div className="border-b bg-white/90">
-        <div className="max-w-6xl mx-auto px-6 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <div className="h-7 w-7 rounded-xl" style={{ background: BRAND.accent }} />
-            <div className="font-semibold">The Shipping Yard</div>
-          </div>
-          <a href="/" className="text-sm hover:underline" style={{ color: BRAND.textMuted }}>← Back to Home</a>
-        </div>
-      </div>
+    <div className="space-y-6">
+      {/* Header card */}
+      <section className="card p-6">
+        <h1 className="text-2xl font-extrabold tracking-tight" style={{ color: "var(--brand-primary)" }}>
+          Parcel Audit — UPS vs PostalMate
+        </h1>
+        <p className="mt-2 text-slate-600">
+          Match by <b>Tracking #</b>. Compare <b>UPS “Billed Charge”</b> vs <b>PostalMate</b>. Includes <b>Invoice #</b> for disputes.
+        </p>
+      </section>
 
-      <div className="max-w-6xl mx-auto p-6">
-        <Card>
-          <CardContent className="space-y-6">
-            {/* Step header */}
-            <div>
-              <div className="text-sm" style={{ color: BRAND.textMuted }}>Step {step} of 3</div>
-              <Progress value={progress} className="h-2 mt-2" />
-              <div className="mt-3 flex flex-wrap items-center gap-2 text-xs">
-                <span className={`rounded-full px-2 py-0.5 ${step >= 1 ? "text-white" : "text-neutral-700"}`} style={{ background: step >= 1 ? BRAND.accent : BRAND.accentSoft }}>Carrier CSVs</span>
-                <span className="text-neutral-400">›</span>
-                <span className={`rounded-full px-2 py-0.5 ${step >= 2 ? "text-white" : "text-neutral-700"}`} style={{ background: step >= 2 ? BRAND.accent : BRAND.accentSoft }}>PostalMate CSVs</span>
-                <span className="text-neutral-400">›</span>
-                <span className={`rounded-full px-2 py-0.5 ${step >= 3 ? "text-white" : "text-neutral-700"}`} style={{ background: step >= 3 ? BRAND.accent : BRAND.accentSoft }}>Results</span>
-              </div>
+      {/* Uploads */}
+      <section className="grid gap-6 md:grid-cols-2">
+        <div className="card p-6">
+          <div className="font-semibold mb-2">UPS Invoice CSV(s)</div>
+          <input type="file" accept=".csv" multiple onChange={(e) => setUPSFiles(e.target.files)} className="w-full" />
+          <p className="mt-2 text-xs text-slate-500">
+            Uses <b>Tracking Number</b>, <b>Billed Charge</b>, and <b>Invoice Number</b>.
+          </p>
+        </div>
+        <div className="card p-6">
+          <div className="font-semibold mb-2">PostalMate CSV(s)</div>
+          <input type="file" accept=".csv" multiple onChange={(e) => setPosFiles(e.target.files)} className="w-full" />
+          <p className="mt-2 text-xs text-slate-500">
+            Skips the first 9 lines. Uses <b>Tracking #</b> and <b>PostalMate</b>.
+          </p>
+        </div>
+      </section>
+
+      {/* Actions */}
+      <section className="flex flex-wrap gap-3">
+        <button
+          onClick={handleAudit}
+          disabled={isRunning}
+          className="btn btn-brand disabled:opacity-60"
+        >
+          {isRunning ? "Analyzing…" : "Start Audit"}
+        </button>
+        <button
+          onClick={() => exportDiscrepanciesCSV(discrepancies)}
+          disabled={!discrepancies.length}
+          className="btn btn-outline disabled:opacity-60"
+        >
+          Export Results (CSV)
+        </button>
+        <button onClick={() => setShowDisputeHelp((s) => !s)} className="btn btn-outline">
+          {showDisputeHelp ? "Hide UPS Dispute Steps" : "Show UPS Dispute Steps"}
+        </button>
+        <button onClick={() => setShowHistoryHelp((s) => !s)} className="btn btn-outline">
+          {showHistoryHelp ? "Hide Dispute/Refund History" : "Where to Find Dispute/Refund History"}
+        </button>
+        <button onClick={copyStepsToClipboard} className="btn btn-accent">Copy Steps</button>
+        <button onClick={downloadStepsPDF} className="btn btn-outline">Download PDF</button>
+      </section>
+
+      {(carrierRows || posRows) && (
+        <section className="text-sm text-slate-600">
+          <span className="mr-4">UPS rows: <b>{carrierRows}</b></span>
+          <span>PostalMate rows: <b>{posRows}</b></span>
+        </section>
+      )}
+
+      {/* Dispute + History panels */}
+      {showDisputeHelp && (
+        <section className="card p-6">
+          <h2 className="text-lg font-bold mb-2">How to Create a UPS Dispute</h2>
+          <ol className="list-decimal pl-5 space-y-1 text-slate-700">
+            {DISPUTE_STEPS.map((s, i) => <li key={i}>{s}</li>)}
+          </ol>
+          <p className="mt-3 text-xs text-slate-500">
+            Tip: Use the <b>Invoice #</b> column in the table below to jump straight to the right invoice.
+          </p>
+        </section>
+      )}
+
+      {showHistoryHelp && (
+        <section className="card p-6">
+          <h2 className="text-lg font-bold mb-2">Where to Find Dispute & Refund History in UPS</h2>
+          <ol className="list-decimal pl-5 space-y-1 text-slate-700">
+            {HISTORY_STEPS.map((s, i) => <li key={i}>{s}</li>)}
+          </ol>
+        </section>
+      )}
+
+      {/* Summary */}
+      {discrepancies.length > 0 && (
+        <section className="card p-6">
+          <div className="grid gap-3 md:grid-cols-5 text-sm">
+            <div className="rounded-lg border p-3 bg-slate-50">
+              <div className="text-slate-500">Overbilled (count)</div>
+              <div className="font-bold">{summary.overCount}</div>
             </div>
+            <div className="rounded-lg border p-3 bg-slate-50">
+              <div className="text-slate-500">Overbilled (total $)</div>
+              <div className="font-bold">${summary.overAmt.toFixed(2)}</div>
+            </div>
+            <div className="rounded-lg border p-3 bg-slate-50">
+              <div className="text-slate-500">Underbilled (count)</div>
+              <div className="font-bold">{summary.underCount}</div>
+            </div>
+            <div className="rounded-lg border p-3 bg-slate-50">
+              <div className="text-slate-500">Underbilled (total $)</div>
+              <div className="font-bold">${summary.underAmt.toFixed(2)}</div>
+            </div>
+            <div className="rounded-lg border p-3 bg-slate-50">
+              <div className="text-slate-500">Match (count)</div>
+              <div className="font-bold">{summary.okCount}</div>
+            </div>
+          </div>
+        </section>
+      )}
 
-            {/* STEP 1: Carriers */}
-            {step === 1 && (
-              <div className="space-y-4">
-                <p className="text-neutral-800">
-                  Upload your <b>carrier CSV(s)</b>. You can select multiple files per carrier.
-                </p>
-                <div className="grid md:grid-cols-3 gap-4">
-                  <div className="border rounded-lg p-3 bg-white">
-                    <Label className="block mb-1">UPS CSV(s)</Label>
-                    <Input type="file" accept=".csv" multiple onChange={onUPSUpload} />
-                    <div className="text-xs mt-1" style={{ color: BRAND.textMuted }}>{ups.length} rows</div>
-                  </div>
-                  <div className="border rounded-lg p-3 bg-white">
-                    <Label className="block mb-1">FedEx CSV(s)</Label>
-                    <Input type="file" accept=".csv" multiple onChange={onFedexUpload} />
-                    <div className="text-xs mt-1" style={{ color: BRAND.textMuted }}>{fedex.length} rows</div>
-                  </div>
-                  <div className="border rounded-lg p-3 bg-white">
-                    <Label className="block mb-1">DHL CSV(s)</Label>
-                    <Input type="file" accept=".csv" multiple onChange={onDHLUpload} />
-                    <div className="text-xs mt-1" style={{ color: BRAND.textMuted }}>{dhl.length} rows</div>
-                  </div>
-                </div>
-                <div className="flex gap-2">
-                  <Button onClick={() => setStep(2)} disabled={!canNext1} style={{ background: BRAND.accent, color: "white" }}>Next</Button>
-                  <Button variant="outline" onClick={() => { setUPS([]); setFedEx([]); setDHL([]); setUpsLate([]); setFedexLate([]); setDhlLate([]); setIssues([]); }}>Clear Carrier Uploads</Button>
-                </div>
-              </div>
-            )}
-
-            {/* STEP 2: PostalMate */}
-            {step === 2 && (
-              <div className="space-y-4">
-                <p className="text-neutral-800">
-                  Upload your <b>PostalMate</b> exports for each carrier. Each slot accepts multiple files.
-                </p>
-                <div className="grid md:grid-cols-3 gap-4">
-                  <div className="border rounded-lg p-3 bg-white">
-                    <Label className="block mb-1">PostalMate – UPS CSV(s)</Label>
-                    <Input type="file" accept=".csv" multiple onChange={async (e) => { setIssues([]); const fs = e.target.files; if (!fs?.length) return; setPosUPS(await parseManyPOSFiles(fs)); }} />
-                    <div className="text-xs mt-1" style={{ color: BRAND.textMuted }}>{posUPS.length} rows</div>
-                  </div>
-                  <div className="border rounded-lg p-3 bg-white">
-                    <Label className="block mb-1">PostalMate – FedEx CSV(s)</Label>
-                    <Input type="file" accept=".csv" multiple onChange={async (e) => { setIssues([]); const fs = e.target.files; if (!fs?.length) return; setPosFedEx(await parseManyPOSFiles(fs)); }} />
-                    <div className="text-xs mt-1" style={{ color: BRAND.textMuted }}>{posFedEx.length} rows</div>
-                  </div>
-                  <div className="border rounded-lg p-3 bg-white">
-                    <Label className="block mb-1">PostalMate – DHL CSV(s)</Label>
-                    <Input type="file" accept=".csv" multiple onChange={async (e) => { setIssues([]); const fs = e.target.files; if (!fs?.length) return; setPosDHL(await parseManyPOSFiles(fs)); }} />
-                    <div className="text-xs mt-1" style={{ color: BRAND.textMuted }}>{posDHL.length} rows</div>
-                  </div>
-                </div>
-                <div className="flex gap-2">
-                  <Button variant="secondary" onClick={() => setStep(1)}>Back</Button>
-                  <Button onClick={() => setStep(3)} disabled={!canNext2} style={{ background: BRAND.accent, color: "white" }}>Next</Button>
-                </div>
-              </div>
-            )}
-
-            {/* STEP 3: Results */}
-            {step === 3 && (
-              <div className="space-y-8">
-                {/* KPIs */}
-                <div className="grid grid-cols-2 md:grid-cols-6 gap-2 text-sm">
-                  <div className="border rounded-md p-3"><div style={{ color: BRAND.textMuted }}>Carrier rows</div><div className="text-lg font-semibold">{carrierRows}</div></div>
-                  <div className="border rounded-md p-3"><div style={{ color: BRAND.textMuted }}>POS rows</div><div className="text-lg font-semibold">{posRows}</div></div>
-                  <div className="border rounded-md p-3"><div style={{ color: BRAND.textMuted }}>Discrepancies</div><div className="text-lg font-semibold">{results.length}</div></div>
-                  <div className="border rounded-md p-3"><div style={{ color: BRAND.textMuted }}>UPS Late</div><div className="text-lg font-semibold">{upsLate.length}</div></div>
-                  <div className="border rounded-md p-3"><div style={{ color: BRAND.textMuted }}>FedEx Late</div><div className="text-lg font-semibold">{fedexLate.length}</div></div>
-                  <div className="border rounded-md p-3"><div style={{ color: BRAND.textMuted }}>DHL Late</div><div className="text-lg font-semibold">{dhlLate.length}</div></div>
-                </div>
-
-                {/* Late tables */}
-                {[{ label: "UPS Late Deliveries", data: upsLate, file: "ups_late.csv" },
-                  { label: "FedEx Late Deliveries", data: fedexLate, file: "fedex_late.csv" },
-                  { label: "DHL Late Deliveries", data: dhlLate, file: "dhl_late.csv" }].map((grp, idx) => (
-                  <div className="space-y-2" key={idx}>
-                    <div className="text-md font-semibold">{grp.label}</div>
-                    <div className="overflow-auto max-h-[45vh] border rounded-md bg-white">
-                      <table className="w-full text-sm">
-                        <thead className="sticky top-0" style={{ background: BRAND.accentSoft }}>
-                          <tr>
-                            <th className="text-left p-2">Tracking</th>
-                            <th className="text-left p-2">Carrier</th>
-                            <th className="text-left p-2">Service</th>
-                            <th className="text-left p-2">Ship Date</th>
-                            <th className="text-left p-2">Delivered</th>
-                            <th className="text-left p-2">Billed (Net)</th>
-                          </tr>
-                        </thead>
-                        <tbody>
-                          {grp.data.length === 0 ? (
-                            <tr><td className="p-3" style={{ color: BRAND.textMuted }} colSpan={6}>No late deliveries found.</td></tr>
-                          ) : (
-                            grp.data.map((r, i) => (
-                              <tr key={i} className="border-t">
-                                <td className="p-2 font-mono">{r.tracking}</td>
-                                <td className="p-2">{r.carrier}</td>
-                                <td className="p-2">{r.service}</td>
-                                <td className="p-2">{r.shipDate}</td>
-                                <td className="p-2">{r.delivered}</td>
-                                <td className="p-2">{r.billed ?? ""}</td>
-                              </tr>
-                            ))
-                          )}
-                        </tbody>
-                      </table>
-                    </div>
-                    <div className="flex gap-2">
-                      <Button variant="secondary" onClick={() => exportLateCSV(grp.data, grp.file)} disabled={!grp.data.length}>Export CSV</Button>
-                    </div>
-                  </div>
-                ))}
-
-                {/* Billing issues */}
-                <div className="space-y-2">
-                  <div className="text-md font-semibold">Billing Issues (Duplicates & Surcharges)</div>
-                  <div className="text-sm" style={{ color: BRAND.textMuted }}>
-                    Uses itemized charge columns when available; otherwise checks fuel % vs transportation.
-                  </div>
-
-                  <div className="overflow-auto max-h-[55vh] border rounded-md bg-white">
-                    <table className="w-full text-sm">
-                      <thead className="sticky top-0" style={{ background: BRAND.accentSoft }}>
-                        <tr>
-                          <th className="text-left p-2">Tracking</th>
-                          <th className="text-left p-2">Carrier</th>
-                          <th className="text-left p-2">Description</th>
-                          <th className="text-left p-2">Amount</th>
-                          <th className="text-left p-2">Note</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {issues.length === 0 ? (
-                          <tr><td className="p-3" style={{ color: BRAND.textMuted }} colSpan={5}>No billing issues detected.</td></tr>
-                        ) : (
-                          issues.map((r, i) => (
-                            <tr key={i} className="border-t">
-                              <td className="p-2 font-mono">{r.tracking}</td>
-                              <td className="p-2">{r.carrier}</td>
-                              <td className="p-2">{r.description}</td>
-                              <td className="p-2">${r.amount.toFixed(2)}</td>
-                              <td className="p-2">{r.note}</td>
-                            </tr>
-                          ))
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
-
-                  <div className="flex gap-2">
-                    <Button variant="secondary" onClick={() => exportChargeIssuesCSV(issues)} disabled={!issues.length}>
-                      Export Billing Issues CSV
-                    </Button>
-                  </div>
-                </div>
-
-                {/* Discrepancies */}
-                <div className="space-y-2">
-                  <div className="text-md font-semibold">Carrier vs POS – Discrepancies</div>
-                  <div className="text-sm" style={{ color: BRAND.textMuted }}>
-                    <b>CarrierOnly</b>: in UPS/FedEx/DHL but not in POS → reconcile POS record.<br />
-                    <b>POSOnly</b>: in POS but not in carrier → consider VOID/REFUND claim.
-                  </div>
-                  <div className="flex flex-wrap gap-2">
-                    <Button variant="secondary" onClick={() => exportCSV(results, "discrepancies.csv")} disabled={!results.length}>
-                      Export Discrepancies CSV
-                    </Button>
-                    <Button variant="secondary" onClick={() => exportPDF_Discrepancies(results)} disabled={!results.length}>
-                      Export Discrepancies PDF
-                    </Button>
-                  </div>
-
-                  <div className="overflow-auto max-h-[65vh] border rounded-md bg-white">
-                    <table className="w-full text-sm">
-                      <thead className="sticky top-0" style={{ background: BRAND.accentSoft }}>
-                        <tr>
-                          <th className="text-left p-2">Tracking</th>
-                          <th className="text-left p-2">Side</th>
-                          <th className="text-left p-2">Recommendation</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {results.length === 0 ? (
-                          <tr><td className="p-3" style={{ color: BRAND.textMuted }} colSpan={3}>No discrepancies found.</td></tr>
-                        ) : (
-                          results.map((r, i) => (
-                            <tr key={i} className="border-t">
-                              <td className="p-2 font-mono">{r.tracking}</td>
-                              <td className="p-2">{r.side}</td>
-                              <td className="p-2">{r.note}</td>
-                            </tr>
-                          ))
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
-
-                  <div className="flex gap-2">
-                    <Button variant="secondary" onClick={() => setStep(2)}>Back</Button>
-                    <Button onClick={() => { window.scrollTo({ top: 0, behavior: "smooth" }); setStep(1); }} style={{ background: BRAND.accent, color: "white" }}>
-                      Start Over
-                    </Button>
-                  </div>
-                </div>
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <div className="text-xs text-center mt-6" style={{ color: BRAND.textMuted }}>
-          © {new Date().getFullYear()} {BRAND.name}. All rights reserved.
-        </div>
-      </div>
-    </main>
+      {/* Results Table */}
+      {discrepancies.length > 0 && (
+        <section className="card p-0 overflow-hidden">
+          <div className="max-h-[70vh] overflow-auto">
+            <table className="table text-sm">
+              <thead className="sticky top-0 z-10">
+                <tr>
+                  <th>Tracking #</th>
+                  <th>Invoice #</th>
+                  <th className="text-right">UPS Billed</th>
+                  <th className="text-right">PostalMate</th>
+                  <th className="text-right">Difference</th>
+                  <th>Note</th>
+                </tr>
+              </thead>
+              <tbody>
+                {discrepancies.map((d, i) => {
+                  const diffColor =
+                    Math.abs(d.difference) < 0.01
+                      ? "text-slate-600"
+                      : d.difference > 0
+                      ? "text-red-600"
+                      : "text-amber-600";
+                  const badge =
+                    d.note === "Match – OK"
+                      ? "bg-green-50 text-green-700 border-green-200"
+                      : d.note === "Overbilled"
+                      ? "bg-red-50 text-red-700 border-red-200"
+                      : "bg-amber-50 text-amber-700 border-amber-200";
+                  return (
+                    <tr key={i} className={i % 2 ? "bg-slate-50/40" : ""}>
+                      <td className="font-mono">{d.tracking}</td>
+                      <td>{d.invoice}</td>
+                      <td className="text-right">${d.carrierAmount.toFixed(2)}</td>
+                      <td className="text-right">${d.posAmount.toFixed(2)}</td>
+                      <td className={`text-right font-semibold ${diffColor}`}>
+                        ${d.difference.toFixed(2)}
+                      </td>
+                      <td>
+                        <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-semibold ${badge}`}>
+                          {d.note}
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+          <div className="p-3 text-xs text-slate-500 border-t">
+            If a tracking appears multiple times across files, amounts are <b>summed per tracking</b> on each side before comparison.
+          </div>
+        </section>
+      )}
+    </div>
   );
 }
